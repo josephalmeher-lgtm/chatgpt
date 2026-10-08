@@ -1,0 +1,1388 @@
+# ============================================================
+# PERÚ OFF: REGRESIÓN Y MACHINE LEARNING POR SKU
+#
+# Conserva la preparación del modelo anterior:
+# 1. Q = volumen desestacionalizado del Excel.
+# 2. P = Revenue / HL originales del mismo mes.
+# 3. Agrupa por precio redondeado a 2 decimales.
+# 4. Promedia Q, P e inventario dentro de cada grupo.
+# 5. Cada grupo tiene el mismo peso.
+#
+# Compara:
+# - Lineal: Q = a + b*P + c*I
+# - Curva de precio: Q = a + f(P) + c*I
+# - Curvas de precio e inventario: Q = a + f(P) + g(I)
+#
+# Selección mediante validación dejando fuera grupos de precio.
+# No selecciona por signo ni por p-value.
+#
+# ELASTICIDAD PRINCIPAL:
+# Elasticidad_precio_controlando_inventario
+#
+# Sin logaritmos, topes ni nuevos filtros de outliers.
+# ============================================================
+
+import numpy as np
+import pandas as pd
+
+from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string as col
+from openpyxl.styles import Font, PatternFill, Alignment
+
+from sklearn.preprocessing import SplineTransformer
+from scipy.stats import t as student_t, norm
+
+from google.colab import files
+from IPython.display import display
+
+
+# ============================================================
+# 1. CONFIGURACIÓN
+# ============================================================
+
+CFG = {
+    "hoja": "Sheet2",
+    "fila_fechas": 6,
+    "primera_fila": 7,
+    "ultima_fila": 193,
+
+    "producto": "D",
+    "sku": None,
+
+    "volumen_original": "E",
+    "volumen_desestacionalizado": "BU",
+    "revenue": "CU",
+
+    # None para una base sin inventario.
+    "inventario": "ES",
+
+    "inicio": "2024-02-01",
+    "numero_meses": 25,
+
+    "decimales_precio": 2,
+    "minimo_meses": 5,
+    "minimo_grupos_precio": 5,
+
+    # Las curvas solo compiten cuando hay suficientes grupos.
+    "minimo_grupos_curva_precio": 12,
+    "minimo_grupos_curvas_PI": 18,
+
+    # Penalización de las curvas.
+    # Mayor alpha = mayor regularización.
+    "alphas": [0.01, 0.1, 1.0],
+
+    "bootstrap_repeticiones": 499,
+    "semilla": 42,
+
+    "alpha_significancia": 0.05,
+    "cambio_precio": 0.05,
+    "cambio_inventario": 0.00,
+
+    "archivo_salida": "Peru_ML_Misma_Logica_Regresion.xlsx",
+}
+
+PRINCIPAL = "Elasticidad_precio_controlando_inventario"
+
+
+def numero(v):
+    if isinstance(v, (bool, np.bool_)):
+        return np.nan
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v) if np.isfinite(v) else np.nan
+    return np.nan
+
+
+def r2(y, pred):
+    y = np.asarray(y, float)
+    pred = np.asarray(pred, float)
+
+    sst = float(np.sum((y - y.mean()) ** 2))
+
+    if len(y) < 2 or sst <= 1e-12:
+        return np.nan
+
+    return float(1 - np.sum((y - pred) ** 2) / sst)
+
+
+# ============================================================
+# 2. EXCEL: MISMA PREPARACIÓN QUE LA REGRESIÓN ANTERIOR
+# ============================================================
+
+def leer_excel(ruta, cfg):
+    fechas = pd.date_range(
+        cfg["inicio"], periods=cfg["numero_meses"], freq="MS"
+    )
+
+    bloques = {
+        "original": col(cfg["volumen_original"]),
+        "Q": col(cfg["volumen_desestacionalizado"]),
+        "Revenue": col(cfg["revenue"]),
+    }
+
+    if cfg["inventario"]:
+        bloques["I"] = col(cfg["inventario"])
+
+    c_producto = col(cfg["producto"])
+    c_sku = col(cfg["sku"]) if cfg["sku"] else None
+
+    ultima_col = max(
+        [c + cfg["numero_meses"] - 1 for c in bloques.values()]
+        + [c_producto]
+        + ([c_sku] if c_sku else [])
+    )
+
+    resumen = []
+    grupos_todos = []
+    detalle_todos = []
+
+    libro = load_workbook(
+        ruta, read_only=True, data_only=True
+    )
+
+    try:
+        if cfg["hoja"] not in libro.sheetnames:
+            raise ValueError(
+                f"No existe {cfg['hoja']!r}. "
+                f"Disponibles: {libro.sheetnames}"
+            )
+
+        ws = libro[cfg["hoja"]]
+
+        encabezados = next(ws.iter_rows(
+            min_row=cfg["fila_fechas"],
+            max_row=cfg["fila_fechas"],
+            max_col=ultima_col,
+            values_only=True
+        ))
+
+        for nombre, inicio_col in bloques.items():
+            for j, fecha in enumerate(fechas):
+                valor = encabezados[inicio_col - 1 + j]
+
+                if not (
+                    hasattr(valor, "year")
+                    and hasattr(valor, "month")
+                ):
+                    raise ValueError(
+                        f"Fecha no reconocida: bloque {nombre}, "
+                        f"posición {j + 1}."
+                    )
+
+                if (
+                    pd.Timestamp(valor).to_period("M")
+                    != fecha.to_period("M")
+                ):
+                    raise ValueError(
+                        f"Bloque {nombre} desalineado "
+                        f"en el mes {j + 1}."
+                    )
+
+        filas = ws.iter_rows(
+            min_row=cfg["primera_fila"],
+            max_row=cfg["ultima_fila"] or ws.max_row,
+            max_col=ultima_col,
+            values_only=True
+        )
+
+        for fila, valores in enumerate(
+            filas, cfg["primera_fila"]
+        ):
+            producto = valores[c_producto - 1]
+
+            if producto is None or not str(producto).strip():
+                continue
+
+            sku = (
+                valores[c_sku - 1]
+                if c_sku else fila - cfg["primera_fila"]
+            )
+
+            if sku is None or not str(sku).strip():
+                continue
+
+            series = {
+                nombre: np.array([
+                    numero(valores[inicio_col - 1 + j])
+                    for j in range(cfg["numero_meses"])
+                ])
+                for nombre, inicio_col in bloques.items()
+            }
+
+            original = series["original"]
+            q = series["Q"]
+            revenue = series["Revenue"]
+            inventario = series.get(
+                "I", np.zeros(cfg["numero_meses"])
+            )
+
+            p = np.full(cfg["numero_meses"], np.nan)
+
+            np.divide(
+                revenue, original, out=p,
+                where=np.isfinite(original) & (original > 0)
+            )
+
+            ventas_validas = (
+                np.isfinite(original) & (original > 0)
+                & np.isfinite(q) & (q > 0)
+                & np.isfinite(revenue) & (revenue > 0)
+                & np.isfinite(p) & (p > 0)
+            )
+
+            inventario_valido = (
+                np.isfinite(inventario) & (inventario >= 0)
+            )
+
+            validos = ventas_validas & inventario_valido
+
+            motivos = np.full(
+                cfg["numero_meses"], "Utilizado", dtype=object
+            )
+            motivos[~ventas_validas] = (
+                "Volumen/precio/revenue cero, faltante o inválido"
+            )
+            motivos[ventas_validas & ~inventario_valido] = (
+                "Inventario faltante o inválido"
+            )
+
+            detalle = pd.DataFrame({
+                "Fila": fila,
+                "SKU": sku,
+                "Producto": str(producto).strip(),
+                "Fecha": fechas,
+                "HL_originales": original,
+                "HL_desestacionalizados": q,
+                "Revenue": revenue,
+                "Precio_por_HL": p,
+                "Inventario": inventario,
+                "Utilizado": validos,
+                "Motivo": motivos,
+            })
+
+            detalle["Precio_grupo"] = np.nan
+            detalle.loc[validos, "Precio_grupo"] = np.round(
+                p[validos], cfg["decimales_precio"]
+            )
+
+            grupos = (
+                detalle.loc[validos]
+                .groupby("Precio_grupo", as_index=False)
+                .agg(
+                    Precio_promedio=("Precio_por_HL", "mean"),
+                    HL_promedio=("HL_desestacionalizados", "mean"),
+                    Inventario_promedio=("Inventario", "mean"),
+                    Meses_en_grupo=("Fecha", "size"),
+                    Primera_fecha=("Fecha", "min"),
+                    Ultima_fecha=("Fecha", "max"),
+                )
+                .sort_values("Precio_promedio")
+                .reset_index(drop=True)
+            )
+
+            grupos.insert(0, "Producto", str(producto).strip())
+            grupos.insert(0, "SKU", sku)
+            grupos.insert(0, "Fila", fila)
+
+            resumen.append({
+                "Fila": fila,
+                "SKU": sku,
+                "Producto": str(producto).strip(),
+                "Meses_validos": int(validos.sum()),
+                "Meses_excluidos": int((~validos).sum()),
+                "Meses_perdidos_por_inventario": int(
+                    (ventas_validas & ~inventario_valido).sum()
+                ),
+                "N_grupos_precio": len(grupos),
+            })
+
+            grupos_todos.append(grupos)
+            detalle_todos.append(detalle)
+
+    finally:
+        libro.close()
+
+    if not resumen:
+        raise ValueError("No se encontraron productos.")
+
+    return (
+        pd.DataFrame(resumen),
+        pd.concat(grupos_todos, ignore_index=True),
+        pd.concat(detalle_todos, ignore_index=True)
+    )
+
+
+# ============================================================
+# 3. MODELOS LINEALES Y CURVAS REGULARIZADAS
+# ============================================================
+
+def ajustar(p, inventario, y, modelo, alpha, usar_inventario):
+    p = np.asarray(p, float)
+    inventario = np.asarray(inventario, float)
+    y = np.asarray(y, float)
+
+    transformadores = []
+    matrices = []
+    nombres = []
+
+    variables = [
+        ("Precio", p, modelo != "lineal")
+    ]
+
+    if usar_inventario:
+        variables.append((
+            "Inventario",
+            inventario,
+            modelo == "curvas_PI"
+        ))
+
+    for nombre, valores, curva in variables:
+        if curva:
+            transformador = SplineTransformer(
+                n_knots=3,
+                degree=2,
+                include_bias=False,
+                extrapolation="linear"
+            ).fit(valores.reshape(-1, 1))
+
+            A = transformador.transform(
+                valores.reshape(-1, 1)
+            )
+
+            nombres.extend([
+                f"{nombre}_base_{j + 1}"
+                for j in range(A.shape[1])
+            ])
+
+        else:
+            transformador = None
+            A = valores.reshape(-1, 1)
+            nombres.append(nombre)
+
+        transformadores.append(transformador)
+        matrices.append(A)
+
+    A = np.column_stack(matrices)
+    media = A.mean(axis=0)
+    escala = A.std(axis=0)
+
+    if np.any(escala <= 1e-12):
+        raise ValueError("Variable explicativa constante")
+
+    X = np.column_stack([
+        np.ones(len(y)),
+        (A - media) / escala
+    ])
+
+    n, k = X.shape
+
+    if n <= k:
+        raise ValueError("Grados de libertad insuficientes")
+
+    if np.linalg.matrix_rank(X) < k:
+        raise ValueError("Variables exactamente dependientes")
+
+    # No penaliza el intercepto.
+    penalizacion = np.diag(
+        [0.0] + [alpha * n] * (k - 1)
+    )
+
+    M = np.linalg.solve(
+        X.T @ X + penalizacion,
+        X.T
+    )
+
+    beta = M @ y
+    H = X @ M
+
+    return {
+        "modelo": modelo,
+        "alpha": alpha,
+        "usar_inventario": usar_inventario,
+        "transformadores": transformadores,
+        "media": media,
+        "escala": escala,
+        "nombres": ["Intercepto"] + nombres,
+        "X": X,
+        "M": M,
+        "beta": beta,
+        "H": H,
+        "p": p,
+        "i": inventario,
+        "y": y,
+        "parametros_efectivos": float(np.trace(H)),
+        "condicion": float(np.linalg.cond(X)),
+    }
+
+
+def matriz_prediccion(fit, p, inventario):
+    p = np.atleast_1d(np.asarray(p, float))
+    inventario = np.atleast_1d(
+        np.asarray(inventario, float)
+    )
+
+    valores = [p]
+    if fit["usar_inventario"]:
+        valores.append(inventario)
+
+    matrices = []
+
+    for variable, transformador in zip(
+        valores, fit["transformadores"]
+    ):
+        A = (
+            transformador.transform(variable.reshape(-1, 1))
+            if transformador is not None
+            else variable.reshape(-1, 1)
+        )
+        matrices.append(A)
+
+    A = np.column_stack(matrices)
+
+    return np.column_stack([
+        np.ones(len(A)),
+        (A - fit["media"]) / fit["escala"]
+    ])
+
+
+def predecir(fit, p, inventario):
+    return (
+        matriz_prediccion(fit, p, inventario)
+        @ fit["beta"]
+    )
+
+
+def vector_derivada(fit, p, inventario, variable):
+    if variable == "inventario" and not fit["usar_inventario"]:
+        return np.zeros(len(fit["beta"]))
+
+    referencia = p if variable == "precio" else inventario
+    serie = fit["p"] if variable == "precio" else fit["i"]
+
+    paso = max(
+        abs(referencia) * 1e-4,
+        np.ptp(serie) * 1e-5,
+        1e-7
+    )
+
+    inferior = max(0.0, referencia - paso)
+    superior = referencia + paso
+
+    if variable == "precio":
+        arriba = matriz_prediccion(
+            fit, [superior], [inventario]
+        )[0]
+        abajo = matriz_prediccion(
+            fit, [inferior], [inventario]
+        )[0]
+    else:
+        arriba = matriz_prediccion(
+            fit, [p], [superior]
+        )[0]
+        abajo = matriz_prediccion(
+            fit, [p], [inferior]
+        )[0]
+
+    return (arriba - abajo) / (superior - inferior)
+
+
+# ============================================================
+# 4. SELECCIÓN POR VALIDACIÓN DE GRUPOS DE PRECIO
+# ============================================================
+
+def candidatos(n, cfg):
+    modelos = [("lineal", 0.0)]
+
+    if n >= cfg["minimo_grupos_curva_precio"]:
+        modelos.extend([
+            ("curva_P", alpha)
+            for alpha in cfg["alphas"]
+        ])
+
+    if (
+        cfg["inventario"]
+        and n >= cfg["minimo_grupos_curvas_PI"]
+    ):
+        modelos.extend([
+            ("curvas_PI", alpha)
+            for alpha in cfg["alphas"]
+        ])
+
+    return modelos
+
+
+def seleccionar(p, inventario, y, cfg):
+    n = len(y)
+    evaluaciones = []
+    usar_i = bool(cfg["inventario"])
+
+    for modelo, alpha in candidatos(n, cfg):
+        errores = []
+
+        try:
+            completo = ajustar(
+                p, inventario, y, modelo, alpha, usar_i
+            )
+
+            # Cada grupo queda fuera una vez.
+            # Escalas y splines se recalculan sin ese grupo.
+            for j in range(n):
+                mantener = np.arange(n) != j
+
+                fit = ajustar(
+                    p[mantener],
+                    inventario[mantener],
+                    y[mantener],
+                    modelo,
+                    alpha,
+                    usar_i
+                )
+
+                estimado = float(predecir(
+                    fit, [p[j]], [inventario[j]]
+                )[0])
+
+                errores.append((y[j] - estimado) ** 2)
+
+        except (ValueError, np.linalg.LinAlgError):
+            continue
+
+        evaluaciones.append({
+            "Modelo": modelo,
+            "Alpha": alpha,
+            "MSE_validacion": float(np.mean(errores)),
+            "SE_MSE": float(
+                np.std(errores, ddof=1) / np.sqrt(n)
+            ),
+            "Parametros_efectivos": completo[
+                "parametros_efectivos"
+            ],
+        })
+
+    if not evaluaciones:
+        raise ValueError("No fue posible validar el modelo")
+
+    tabla = pd.DataFrame(evaluaciones)
+    mejor = tabla.loc[tabla["MSE_validacion"].idxmin()]
+
+    # Preferencia por menor complejidad si los errores
+    # están dentro de un error estándar del mejor.
+    limite = mejor["MSE_validacion"] + mejor["SE_MSE"]
+
+    elegibles = tabla[
+        tabla["MSE_validacion"] <= limite
+    ]
+
+    elegido = (
+        elegibles
+        .sort_values(["Parametros_efectivos", "MSE_validacion"])
+        .iloc[0]
+    )
+
+    tabla["Elegido"] = (
+        (tabla["Modelo"] == elegido["Modelo"])
+        & (tabla["Alpha"] == elegido["Alpha"])
+    )
+
+    return (
+        elegido["Modelo"],
+        float(elegido["Alpha"]),
+        tabla
+    )
+
+
+# ============================================================
+# 5. ELASTICIDAD E INFERENCIA
+# ============================================================
+
+def elasticidad_referencia(fit, repeticiones, semilla):
+    p_ref = float(fit["p"].mean())
+    i_ref = float(fit["i"].mean())
+
+    # En OLS con intercepto, esta predicción coincide
+    # con el volumen promedio de los grupos.
+    q_ref = float(predecir(
+        fit, [p_ref], [i_ref]
+    )[0])
+
+    if not np.isfinite(q_ref) or q_ref <= 0:
+        raise ValueError(
+            "Predicción de referencia no positiva; "
+            "elasticidad no interpretable"
+        )
+
+    dp_vector = vector_derivada(
+        fit, p_ref, i_ref, "precio"
+    )
+    di_vector = vector_derivada(
+        fit, p_ref, i_ref, "inventario"
+    )
+
+    pendiente_p = float(dp_vector @ fit["beta"])
+    pendiente_i = float(di_vector @ fit["beta"])
+
+    ep = pendiente_p * p_ref / q_ref
+    ei = (
+        pendiente_i * i_ref / q_ref
+        if fit["usar_inventario"] else np.nan
+    )
+
+    residuos = fit["y"] - fit["X"] @ fit["beta"]
+    n, k = fit["X"].shape
+    leverage = np.diag(fit["H"])
+
+    if fit["modelo"] == "lineal":
+        gl = n - k
+
+        cov = (
+            float(residuos @ residuos) / gl
+            * np.linalg.inv(fit["X"].T @ fit["X"])
+        )
+
+        se_pendiente = np.sqrt(max(
+            float(dp_vector @ cov @ dp_vector), 0.0
+        ))
+
+        se_elasticidad = se_pendiente * p_ref / q_ref
+
+        pvalue = (
+            float(2 * student_t.sf(
+                abs(ep / se_elasticidad), gl
+            ))
+            if se_elasticidad > 1e-12 else np.nan
+        )
+
+        critico = float(student_t.ppf(0.975, gl))
+        metodo = "t OLS clásico; referencias fijas"
+
+    else:
+        # Wild bootstrap con diseño y regularización fijos.
+        # Mantiene referencias P, I y Q fijas para la inferencia
+        # de la pendiente local, como la conversión del OLS.
+        rng = np.random.default_rng(semilla)
+
+        residuos_ajustados = residuos / np.sqrt(
+            np.maximum(1 - leverage, 0.05)
+        )
+
+        pesos = rng.choice(
+            [-1.0, 1.0],
+            size=(n, repeticiones)
+        )
+
+        y_bootstrap = (
+            (fit["X"] @ fit["beta"])[:, None]
+            + residuos_ajustados[:, None] * pesos
+        )
+
+        betas_bootstrap = fit["M"] @ y_bootstrap
+        pendientes_bootstrap = dp_vector @ betas_bootstrap
+
+        se_pendiente = float(np.std(
+            pendientes_bootstrap, ddof=1
+        ))
+
+        se_elasticidad = se_pendiente * p_ref / q_ref
+
+        pvalue = (
+            float(2 * norm.sf(abs(ep / se_elasticidad)))
+            if se_elasticidad > 1e-12 else np.nan
+        )
+
+        critico = 1.96
+        metodo = (
+            "Wald normal con SE wild bootstrap; "
+            "modelo y referencias fijos"
+        )
+
+    return {
+        "Elasticidad": ep,
+        "Elasticidad_I": ei,
+        "SE": float(se_elasticidad),
+        "P_value": pvalue,
+        "IC_inferior": ep - critico * se_elasticidad,
+        "IC_superior": ep + critico * se_elasticidad,
+        "Precio_referencia": p_ref,
+        "Inventario_referencia": i_ref,
+        "Volumen_referencia": q_ref,
+        "Pendiente_precio": pendiente_p,
+        "Pendiente_inventario": pendiente_i,
+        "Metodo_inferencia": metodo,
+        "Leverage_max": float(leverage.max()),
+    }
+
+
+def fdr_bh(pvalues):
+    p = np.asarray(pvalues, float)
+    q = np.full(len(p), np.nan)
+    validos = np.flatnonzero(np.isfinite(p))
+
+    if len(validos):
+        orden = validos[np.argsort(p[validos])]
+        ajustes = (
+            p[orden] * len(orden)
+            / np.arange(1, len(orden) + 1)
+        )
+        q[orden] = np.minimum(
+            1,
+            np.minimum.accumulate(ajustes[::-1])[::-1]
+        )
+
+    return q
+
+
+# ============================================================
+# 6. PROCESAMIENTO POR SKU
+# ============================================================
+
+def procesar(resumen, grupos, cfg):
+    resultados = []
+    validaciones = []
+    predicciones = []
+    prueba_todos = []
+    coeficientes = []
+
+    usar_i = bool(cfg["inventario"])
+
+    for contador, registro in enumerate(
+        resumen.to_dict("records"), 1
+    ):
+        if contador == 1 or contador % 20 == 0:
+            print(
+                f"Procesando {contador}/{len(resumen)}...",
+                flush=True
+            )
+
+        g = (
+            grupos[grupos["Fila"] == registro["Fila"]]
+            .sort_values("Precio_promedio")
+            .reset_index(drop=True)
+        )
+
+        salida = {
+            **registro,
+            PRINCIPAL: np.nan,
+            "Elasticidad_inventario_controlando_precio": np.nan,
+            "Elasticidad_conjunta_P_e_I": np.nan,
+            "Modelo_utilizado": "",
+            "Alpha_regularizacion": np.nan,
+            "Error_estandar_elasticidad": np.nan,
+            "P_value": np.nan,
+            "IC95_inferior": np.nan,
+            "IC95_superior": np.nan,
+            "RSQ": np.nan,
+            "RSQ_ajustado_aprox": np.nan,
+            "RSQ_prueba_grupos": np.nan,
+            "RSQ_prueba_lineal": np.nan,
+            "Grupos_prueba": 0,
+            "Parametros_efectivos": np.nan,
+            "Condicion": np.nan,
+            "Precio_referencia": np.nan,
+            "Inventario_referencia": np.nan,
+            "Volumen_referencia": np.nan,
+            "Pendiente_precio_en_referencia": np.nan,
+            "Impacto_precio_pct": np.nan,
+            "Impacto_combinado_pct": np.nan,
+            "Elasticidad_lineal_comparacion": np.nan,
+            "P_value_lineal_comparacion": np.nan,
+            "RSQ_lineal_comparacion": np.nan,
+            "Metodo_inferencia": "",
+            "Leverage_max": np.nan,
+            "Nota": "",
+            "Status": "No estimable",
+        }
+
+        if registro["Meses_validos"] < cfg["minimo_meses"]:
+            salida["Nota"] = "Meses válidos insuficientes"
+            resultados.append(salida)
+            continue
+
+        if len(g) < cfg["minimo_grupos_precio"]:
+            salida["Nota"] = "Grupos de precio insuficientes"
+            resultados.append(salida)
+            continue
+
+        p = g["Precio_promedio"].to_numpy(float)
+        inventario = g["Inventario_promedio"].to_numpy(float)
+        y = g["HL_promedio"].to_numpy(float)
+        n = len(y)
+
+        if usar_i and np.std(inventario) <= 1e-12:
+            salida["Nota"] = "Inventario promedio constante"
+            resultados.append(salida)
+            continue
+
+        if np.std(y) <= 1e-12:
+            salida["Nota"] = "Volumen promedio constante"
+            resultados.append(salida)
+            continue
+
+        notas = []
+
+        try:
+            # Modelo anterior sobre EXACTAMENTE los mismos grupos.
+            base = ajustar(
+                p, inventario, y, "lineal", 0.0, usar_i
+            )
+            est_base = elasticidad_referencia(
+                base, cfg["bootstrap_repeticiones"],
+                cfg["semilla"] + registro["Fila"]
+            )
+
+            # Reserva grupos distribuidos a lo largo del rango.
+            # Es prueba entre precios, NO prueba cronológica.
+            indices_test = np.arange(2, n, 5)
+
+            hay_prueba = (
+                len(indices_test) >= 3
+                and n - len(indices_test) >= 5
+            )
+
+            desarrollo = np.ones(n, dtype=bool)
+
+            if hay_prueba:
+                desarrollo[indices_test] = False
+
+            modelo, alpha, tabla_cv = seleccionar(
+                p[desarrollo],
+                inventario[desarrollo],
+                y[desarrollo],
+                cfg
+            )
+
+            tabla_cv["Fila"] = registro["Fila"]
+            tabla_cv["SKU"] = registro["SKU"]
+            validaciones.append(tabla_cv)
+
+            # Prueba antes de incorporar los grupos reservados.
+            if hay_prueba:
+                test = ~desarrollo
+
+                fit_train = ajustar(
+                    p[desarrollo],
+                    inventario[desarrollo],
+                    y[desarrollo],
+                    modelo, alpha, usar_i
+                )
+
+                pred_test = predecir(
+                    fit_train, p[test], inventario[test]
+                )
+
+                base_train = ajustar(
+                    p[desarrollo],
+                    inventario[desarrollo],
+                    y[desarrollo],
+                    "lineal", 0.0, usar_i
+                )
+
+                pred_base_test = predecir(
+                    base_train, p[test], inventario[test]
+                )
+
+                salida["RSQ_prueba_grupos"] = r2(
+                    y[test], pred_test
+                )
+                salida["RSQ_prueba_lineal"] = r2(
+                    y[test], pred_base_test
+                )
+                salida["Grupos_prueba"] = int(test.sum())
+
+                for j, indice in enumerate(np.flatnonzero(test)):
+                    prueba_todos.append({
+                        "Fila": registro["Fila"],
+                        "SKU": registro["SKU"],
+                        "Precio": p[indice],
+                        "Inventario": inventario[indice],
+                        "HL_real": y[indice],
+                        "HL_predicho_ML": pred_test[j],
+                        "HL_predicho_lineal": pred_base_test[j],
+                    })
+            else:
+                notas.append(
+                    "Sin prueba reservada; validación usada para selección"
+                )
+
+            # Ajuste final con todos los grupos.
+            fit = ajustar(
+                p, inventario, y, modelo, alpha, usar_i
+            )
+
+            est = elasticidad_referencia(
+                fit,
+                cfg["bootstrap_repeticiones"],
+                cfg["semilla"] + registro["Fila"]
+            )
+
+        except (ValueError, np.linalg.LinAlgError) as error:
+            salida["Nota"] = str(error)
+            resultados.append(salida)
+            continue
+
+        pred = predecir(fit, p, inventario)
+        rsq = r2(y, pred)
+        edf = fit["parametros_efectivos"]
+
+        rsq_ajustado = (
+            1 - (1 - rsq) * (n - 1) / (n - edf)
+            if n > edf else np.nan
+        )
+
+        ep = est["Elasticidad"]
+        ei = est["Elasticidad_I"]
+        pvalue = est["P_value"]
+
+        if np.isfinite(pvalue):
+            significativa = pvalue < cfg["alpha_significancia"]
+            salida["Status"] = (
+                ("Negativa" if ep < 0 else "Positiva o nula")
+                + (
+                    " significativa"
+                    if significativa else " no significativa"
+                )
+            )
+        else:
+            salida["Status"] = "Estimable; inferencia no disponible"
+
+        p_ref = est["Precio_referencia"]
+        i_ref = est["Inventario_referencia"]
+        q_ref = est["Volumen_referencia"]
+
+        nuevo_p = p_ref * (1 + cfg["cambio_precio"])
+        nuevo_i = i_ref * (1 + cfg["cambio_inventario"])
+
+        q_precio = float(predecir(
+            fit, [nuevo_p], [i_ref]
+        )[0])
+
+        q_combinado = float(predecir(
+            fit, [nuevo_p], [nuevo_i]
+        )[0])
+
+        impacto_p = (
+            100 * (q_precio / q_ref - 1)
+            if q_precio > 0 else np.nan
+        )
+        impacto_combinado = (
+            100 * (q_combinado / q_ref - 1)
+            if q_combinado > 0 else np.nan
+        )
+
+        if registro["Meses_validos"] < 12:
+            notas.append("Historia menor a 12 meses")
+
+        if n < 6:
+            notas.append("Pocos grupos para inferencia")
+
+        if fit["condicion"] > 30:
+            notas.append("Colinealidad elevada")
+
+        if est["Leverage_max"] > 0.8:
+            notas.append("Algún grupo tiene influencia elevada")
+
+        if q_precio <= 0 or q_combinado <= 0:
+            notas.append(
+                "Escenario predice volumen no positivo"
+            )
+
+        if nuevo_p < p.min() or nuevo_p > p.max():
+            notas.append(
+                "Escenario de precio fuera del rango observado"
+            )
+
+        if modelo != "lineal":
+            notas.append(
+                "Inferencia aproximada; condicionada a curva y alpha elegidos"
+            )
+
+        salida.update({
+            PRINCIPAL: ep,
+            "Elasticidad_inventario_controlando_precio": ei,
+            "Elasticidad_conjunta_P_e_I": (
+                ep + ei if np.isfinite(ei) else np.nan
+            ),
+            "Modelo_utilizado": modelo,
+            "Alpha_regularizacion": alpha,
+            "Error_estandar_elasticidad": est["SE"],
+            "P_value": pvalue,
+            "IC95_inferior": est["IC_inferior"],
+            "IC95_superior": est["IC_superior"],
+            "RSQ": rsq,
+            "RSQ_ajustado_aprox": rsq_ajustado,
+            "Parametros_efectivos": edf,
+            "Condicion": fit["condicion"],
+            "Precio_referencia": p_ref,
+            "Inventario_referencia": i_ref,
+            "Volumen_referencia": q_ref,
+            "Pendiente_precio_en_referencia": est[
+                "Pendiente_precio"
+            ],
+            "Impacto_precio_pct": impacto_p,
+            "Impacto_combinado_pct": impacto_combinado,
+            "Elasticidad_lineal_comparacion": est_base["Elasticidad"],
+            "P_value_lineal_comparacion": est_base["P_value"],
+            "RSQ_lineal_comparacion": r2(
+                y, predecir(base, p, inventario)
+            ),
+            "Metodo_inferencia": est["Metodo_inferencia"],
+            "Leverage_max": est["Leverage_max"],
+            "Nota": "; ".join(notas),
+        })
+
+        resultados.append(salida)
+
+        # Elasticidades locales en cada grupo.
+        for j in range(n):
+            pendiente = float(
+                vector_derivada(
+                    fit, p[j], inventario[j], "precio"
+                ) @ fit["beta"]
+            )
+
+            predicciones.append({
+                "Fila": registro["Fila"],
+                "SKU": registro["SKU"],
+                "Precio_grupo": g.loc[j, "Precio_grupo"],
+                "Precio": p[j],
+                "Inventario": inventario[j],
+                "HL_real": y[j],
+                "HL_estimado": pred[j],
+                "Residuo_HL": y[j] - pred[j],
+                "Pendiente_precio_local": pendiente,
+                "Elasticidad_precio_local": (
+                    pendiente * p[j] / pred[j]
+                    if pred[j] > 0 else np.nan
+                ),
+            })
+
+        # Coeficientes sobre bases estandarizadas:
+        # en curvas no se interpretan como elasticidades.
+        for j, nombre in enumerate(fit["nombres"]):
+            coeficientes.append({
+                "Fila": registro["Fila"],
+                "SKU": registro["SKU"],
+                "Modelo": modelo,
+                "Termino": nombre,
+                "Coeficiente_base_estandarizada": fit["beta"][j],
+            })
+
+    resultado = pd.DataFrame(resultados)
+
+    resultado["Q_value_FDR"] = fdr_bh(
+        resultado["P_value"].to_numpy()
+    )
+
+    resultado["Negativa_significativa_FDR"] = (
+        (resultado[PRINCIPAL] < 0)
+        & (
+            resultado["Q_value_FDR"]
+            < cfg["alpha_significancia"]
+        )
+    )
+
+    return {
+        "Elasticidades_SKU": resultado,
+        "Validacion_modelos": (
+            pd.concat(validaciones, ignore_index=True)
+            if validaciones else pd.DataFrame()
+        ),
+        "Predicciones_grupos": pd.DataFrame(predicciones),
+        "Prueba_grupos": pd.DataFrame(prueba_todos),
+        "Coeficientes_bases": pd.DataFrame(coeficientes),
+    }
+
+
+# ============================================================
+# 7. CONTEOS Y EXCEL
+# ============================================================
+
+def exportar(tablas, grupos, detalle, cfg):
+    resultado = tablas["Elasticidades_SKU"]
+    e = resultado[PRINCIPAL]
+    p = resultado["P_value"]
+
+    significativa = (
+        p.notna() & (p < cfg["alpha_significancia"])
+    )
+
+    conteo = pd.DataFrame({
+        "Resultado": [
+            "Negativas significativas",
+            "Negativas no significativas",
+            "Positivas o nulas significativas",
+            "Positivas o nulas no significativas",
+            "Estimables sin inferencia",
+            "No estimables",
+            "TOTAL SKUs",
+        ],
+        "Cantidad": [
+            int(((e < 0) & significativa).sum()),
+            int(((e < 0) & p.notna() & ~significativa).sum()),
+            int(((e >= 0) & significativa).sum()),
+            int(((e >= 0) & p.notna() & ~significativa).sum()),
+            int((e.notna() & p.isna()).sum()),
+            int(e.isna().sum()),
+            len(resultado),
+        ],
+    })
+
+    modelos = (
+        resultado.loc[e.notna(), "Modelo_utilizado"]
+        .value_counts()
+        .rename_axis("Modelo")
+        .reset_index(name="SKUs")
+    )
+
+    motivos = (
+        resultado.loc[e.isna(), "Nota"]
+        .value_counts()
+        .rename_axis("Motivo")
+        .reset_index(name="SKUs")
+    )
+
+    metodologia = pd.DataFrame([
+        (
+            "Elasticidad principal",
+            PRINCIPAL
+        ),
+        (
+            "Definición",
+            "Pendiente local de Q respecto a P, multiplicada por "
+            "P_referencia/Q_predicho_referencia. Inventario fijo."
+        ),
+        (
+            "Referencia",
+            "Precio e inventario promedio de los grupos. "
+            "En OLS con intercepto, Q_predicho en esa referencia "
+            "coincide con Q promedio."
+        ),
+        (
+            "Preparación",
+            "Q desestacionalizado del Excel. "
+            "Precio = revenue/HL originales. "
+            "Promedios por precio redondeado; igual peso por grupo."
+        ),
+        (
+            "Lineal",
+            "Reproduce Q = a + b*P + c*I sobre los grupos. "
+            "Elasticidad = b*P_referencia/Q_referencia."
+        ),
+        (
+            "Curvas",
+            "Modelo aditivo con splines cuadráticos regularizados. "
+            "No incluye interacción precio-inventario."
+        ),
+        (
+            "Selección",
+            "Validación dejando fuera grupos de precio. "
+            "Se recalculan transformaciones con cada entrenamiento. "
+            "Se prefiere menor complejidad con error comparable."
+        ),
+        (
+            "Prueba",
+            "Grupos de precio reservados y no usados para selección. "
+            "No es prueba temporal ni valida causalidad."
+        ),
+        (
+            "P-value lineal",
+            "Prueba t OLS convencional de pendiente cero. "
+            "Supone errores independientes y homocedásticos entre grupos."
+        ),
+        (
+            "P-value curvas",
+            "Prueba Wald normal con SE de wild bootstrap condicional. "
+            "Referencias y regularización fijas. "
+            "No corrige toda la incertidumbre de selección "
+            "ni el sesgo de regularización."
+        ),
+        (
+            "Intervalos",
+            "Intervalos de la pendiente local convertidos a elasticidad "
+            "con referencias fijas. No son intervalos de predicción."
+        ),
+        (
+            "Dependencia",
+            "La agrupación no garantiza independencia de los errores. "
+            "No se aplica HAC temporal sobre grupos ordenados por precio."
+        ),
+        (
+            "R2",
+            "Calculado sobre HL promedio por grupo, no logaritmos. "
+            "R2 ajustado es convencional en lineal y aproximado "
+            "con grados de libertad efectivos en curvas."
+        ),
+        (
+            "FDR",
+            "Benjamini-Hochberg para muchos SKUs; hereda las "
+            "limitaciones de los p-values."
+        ),
+        (
+            "Elasticidad conjunta",
+            "Suma local precio + inventario: dirección donde ambos "
+            "cambian en el mismo porcentaje. No se usa para el conteo."
+        ),
+        (
+            "Escenarios",
+            "Reevalúa la curva al nuevo precio/inventario. "
+            "El efecto de un cambio grande no es necesariamente "
+            "elasticidad local multiplicada por ese porcentaje."
+        ),
+        (
+            "Coeficientes de bases",
+            "Son coeficientes de variables estandarizadas. "
+            "En splines, un coeficiente de base no es una elasticidad."
+        ),
+        (
+            "Alcance",
+            "Asociación condicionada al modelo y datos disponibles. "
+            "No elimina crecimiento por lanzamiento ni demuestra "
+            "causalidad. No selecciona por signo."
+        ),
+    ], columns=["Tema", "Descripción"])
+
+    configuracion = pd.DataFrame([
+        {"Parámetro": k, "Valor": str(v)}
+        for k, v in cfg.items()
+    ])
+
+    hojas = {
+        "Conteo": conteo,
+        **tablas,
+        "Modelos_utilizados": modelos,
+        "Motivos_no_estimables": motivos,
+        "Promedios_por_precio": grupos,
+        "Detalle_mensual": detalle,
+        "Metodologia": metodologia,
+        "Configuracion": configuracion,
+    }
+
+    with pd.ExcelWriter(
+        cfg["archivo_salida"],
+        engine="openpyxl",
+        datetime_format="yyyy-mm-dd"
+    ) as writer:
+        for nombre, tabla in hojas.items():
+            tabla.replace(
+                [np.inf, -np.inf], np.nan
+            ).to_excel(
+                writer, sheet_name=nombre, index=False
+            )
+
+            ws = writer.sheets[nombre]
+            ws.freeze_panes = "A2"
+
+            if len(tabla.columns):
+                ws.auto_filter.ref = ws.dimensions
+
+            ws.row_dimensions[1].height = 48
+
+            for celda in ws[1]:
+                celda.font = Font(
+                    bold=True, color="FFFFFF"
+                )
+                celda.fill = PatternFill(
+                    "solid", fgColor="17365D"
+                )
+                celda.alignment = Alignment(
+                    wrap_text=True, vertical="center"
+                )
+
+            for columna in ws.columns:
+                encabezado = str(columna[0].value or "")
+
+                ws.column_dimensions[
+                    columna[0].column_letter
+                ].width = (
+                    65 if encabezado in (
+                        "Producto", "Nota", "Descripción"
+                    )
+                    else min(42, max(16, len(encabezado) + 2))
+                )
+
+                for celda in columna[1:]:
+                    if isinstance(celda.value, float):
+                        celda.number_format = (
+                            "0.0000E+00"
+                            if "value" in encabezado
+                            else "0.0000"
+                        )
+
+    return conteo, modelos, motivos
+
+
+# ============================================================
+# 8. EJECUCIÓN: SUBIR ARCHIVO
+# ============================================================
+
+if CFG["bootstrap_repeticiones"] < 99:
+    raise ValueError("Usa al menos 99 repeticiones de bootstrap.")
+
+if CFG["cambio_precio"] <= -1:
+    raise ValueError("Cambio de precio debe ser mayor que -100%.")
+
+if CFG["cambio_inventario"] < -1:
+    raise ValueError("Inventario no puede reducirse más de 100%.")
+
+print("Sube tu Excel Nielsen con Sheet2 recalculada y guardada:")
+subidos = files.upload()
+
+if len(subidos) != 1:
+    raise ValueError("Sube exactamente un archivo Excel.")
+
+archivo = next(iter(subidos))
+
+print("\nLeyendo datos...", flush=True)
+resumen, grupos, detalle = leer_excel(archivo, CFG)
+
+print(f"Productos encontrados: {len(resumen)}")
+print("Volumen: desestacionalizado del Excel.")
+print("Preparación: promedios por precio.")
+print("Requisitos: 5 meses válidos y 5 grupos de precio.")
+print("Elasticidad principal:", PRINCIPAL)
+
+tablas = procesar(resumen, grupos, CFG)
+resultado = tablas["Elasticidades_SKU"]
+
+conteo, modelos, motivos = exportar(
+    tablas, grupos, detalle, CFG
+)
+
+pd.set_option("display.max_rows", 250)
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", 65)
+
+print("\n================ CONTEO ================")
+display(conteo)
+
+print(
+    "\nNegativas significativas tras FDR:",
+    int(resultado["Negativa_significativa_FDR"].sum())
+)
+
+print("\n================ MODELOS UTILIZADOS ================")
+display(modelos)
+
+print("\n================ RESULTADOS POR SKU ================")
+display(resultado[[
+    "SKU",
+    "Producto",
+    "Meses_validos",
+    "N_grupos_precio",
+    "Modelo_utilizado",
+    PRINCIPAL,
+    "P_value",
+    "IC95_inferior",
+    "IC95_superior",
+    "RSQ",
+    "RSQ_prueba_grupos",
+    "Elasticidad_lineal_comparacion",
+    "Status",
+]])
+
+print("\n================ MOTIVOS DE EXCLUSIÓN ================")
+display(motivos)
+
+print("\nExcel generado:", CFG["archivo_salida"])
+files.download(CFG["archivo_salida"])
+
+# Disponibles:
+# resultado, tablas, grupos, detalle, conteo, modelos, motivos
